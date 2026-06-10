@@ -33,6 +33,7 @@ import (
 	"github.com/mattn/go-runewidth"
 	"github.com/olekukonko/tablewriter"
 	"github.com/pkg/browser"
+	"github.com/soheilhy/cmux"
 	"github.com/spf13/cobra"
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/sync/errgroup"
@@ -1998,17 +1999,151 @@ func RunServer(_ *cobra.Command, _ []string) error {
 		return err
 	}
 
-	ln, err := net.Listen("tcp", envconfig.Host().Host)
+	lnHTTP, err := net.Listen("tcp", envconfig.Host().Host)
 	if err != nil {
 		return err
 	}
 
-	err = server.Serve(ln)
-	if errors.Is(err, http.ErrServerClosed) {
-		return nil
+	samePort := envconfig.GRPCSamePort()
+
+	var lnGRPC net.Listener
+	if !samePort {
+		if u := envconfig.GRPCHost(); u != nil && u.Host != "" {
+			lnGRPC, err = net.Listen("tcp", u.Host)
+			if err != nil {
+				return err
+			}
+		}
 	}
 
-	return err
+	// Setup once for shared *Server + *Scheduler (reconciliation/queue, VRAM, no contention).
+	// Mirrors the reliable requirement for single sched instance across protocols.
+	// Pass the HTTP listener addr so middleware (allowedHosts etc.) baked into the
+	// returned handler sees the correct primary address even in dual mode.
+	s, h, sched, err := server.SetupServer(lnHTTP.Addr())
+	if err != nil {
+		return err
+	}
+	_ = sched // attached to s; unload coordinated below
+
+	// Always wire via errgroup + bounded workers (no fire-and-forget). SetLimit(2) default; 3 for cmux (http+grpc+cmux serve).
+	// Use explicit cancel so signal can propagate to ServeGRPC (ctx first) for prompt stop (no GPU leak).
+	// Phase 5: sameport path uses full errgroup/bounded + new observability logs with "reason" per SKILL + phased doc.
+	ctx, cancel := context.WithCancel(context.Background())
+	g, gctx := errgroup.WithContext(ctx)
+
+	var httpSrv *http.Server
+	var cmuxMux cmux.CMux
+
+	// Setup http server + global route registration *once* before any g.Go. This ensures:
+	// - httpSrv is non-nil for signal handler in all paths (fixes latent nil race).
+	// - http.Handle happens before any Serve (pprof DefaultServeMux compat).
+	// - drastically reduces dupe between sameport/default while keeping default path semantics identical.
+	// (Prior textual dupe was deliberate for regression-proofing per review; hoisting common ctor+register is simpler, still safe, and addresses med dupe + race findings.)
+	httpSrv = &http.Server{
+		// Use http.DefaultServeMux so we get net/http/pprof for free (preserves prior behavior).
+		Handler: nil,
+	}
+	http.Handle("/", h)
+
+	if samePort {
+		// Opt-in cmux same-port (OLLAMA_GRPC_SAMEPORT=1). High risk per Plan/Phase5; default path below is unchanged.
+		g.SetLimit(3)
+		m := cmux.New(lnHTTP)
+		cmuxMux = m
+		slog.Debug("cmux created", "component", "cmd", "addr", lnHTTP.Addr().String(), "reason", "OLLAMA_GRPC_SAMEPORT=1; single listener will be multiplexed for gRPC (h2c) + HTTP1/Connect")
+
+		// gRPC/Connect matcher: HTTP2 with grpc content-type header (standard for soheilhy/cmux + h2c gRPC/Connect).
+		// Falls back for HTTP/1.1 Gin + Connect JSON etc.
+		grpcL := m.MatchWithWriters(cmux.HTTP2MatchHeaderFieldSendSettings("content-type", "application/grpc"))
+		httpL := m.Match(cmux.Any())
+		slog.Debug("cmux matchers configured", "component", "cmd", "reason", "grpcL matches HTTP2 content-type application/grpc -> gRPC handler; httpL Any() -> primary Gin routes (HTTP1 + fallback); note: long-lived agent clients may reuse conns (report p71 issues), risking HOL blocking under concurrent dual HTTP+gRPC streams on same model; pprof/lsof soak hooks: during manual long-run use `lsof -p $(pgrep ollama) -n -iTCP | wc -l` for conn stability (expect no growth), `go tool pprof -http=:6061 http://localhost:11434/debug/pprof/goroutine` (pprof on DefaultServeMux preserved) + heap for leak check post mid-gen cancel; see soak skeleton in docs/grpc-phased-reliable-approach.md")
+
+		slog.Info("grpc sameport decision", "component", "cmd", "sameport", true, "primary_addr", lnHTTP.Addr().String(), "reason", "OLLAMA_GRPC_SAMEPORT=1 opt-in; using cmux to multiplex gRPC (h2c) and HTTP on single primary listener; separate-port remains the stable default for zero regression")
+
+		g.Go(func() error {
+			slog.Info(fmt.Sprintf("Listening on %s (HTTP+GRPC sameport via cmux, version %s)", lnHTTP.Addr(), version.Version))
+			if err := httpSrv.Serve(httpL); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				return err
+			}
+			return nil
+		})
+
+		g.Go(func() error {
+			return s.ServeGRPC(gctx, grpcL)
+		})
+
+		g.Go(func() error {
+			slog.Info("cmux serve starting", "component", "cmd", "addr", lnHTTP.Addr().String(), "reason", "cmux master loop accepting conns; grpc content-type -> gRPC h2c handler (registerServices + interceptors), remainder -> HTTP Gin routes; all bounded by errgroup owner + ctx shutdown")
+			if err := m.Serve(); err != nil {
+				if isClosedErr(err) {
+					slog.Debug("cmux serve err treated as closed (non-fatal graceful path)", "component", "cmd", "reason", "cmux edge case hardened (ErrListenerClosed/ErrServerClosed via Is + strings); supports long-running dual (HTTP+gRPC concurrent same model) + mid-gen cancel on sameport without conn leak (bounded errgroup/ctx from P1/2 + cmux Close idempotent); agent-like long-lived clients: conn reuse expected safe; monitor via lsof/pprof in soak (report sec4 item5); status=closed-expected", "status", "ok")
+					return nil
+				}
+				return err
+			}
+			return nil
+		})
+	} else {
+		g.SetLimit(2)
+
+		g.Go(func() error {
+			slog.Info(fmt.Sprintf("Listening on %s (version %s)", lnHTTP.Addr(), version.Version))
+			if err := httpSrv.Serve(lnHTTP); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				return err
+			}
+			return nil
+		})
+
+		if lnGRPC != nil {
+			g.Go(func() error {
+				return s.ServeGRPC(gctx, lnGRPC)
+			})
+		}
+	}
+
+	// Centralized signals for dual (or single) graceful shutdown: close http, cancel ctx (for gRPC ServeGRPC),
+	// unload runners (shared sched), let errgroup wait. Enhanced for cmux Close in sameport.
+	signals := make(chan os.Signal, 1)
+	signal.Notify(signals, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		<-signals
+		slog.Info("received shutdown signal")
+		cancel()
+		if httpSrv != nil {
+			httpSrv.Close()
+		}
+		if cmuxMux != nil {
+			cmuxMux.Close()
+			slog.Debug("cmux closed", "component", "cmd", "reason", "shutdown signal; sub-listeners (grpcL/httpL) will unblock their Serves")
+		}
+		if s != nil {
+			s.UnloadAllRunners()
+		}
+		// cancel above + close will cause ServeGRPC (if running) to shutdown promptly
+		// (its select on ctx) and g.Wait to return.
+	}()
+
+	if err := g.Wait(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		return err
+	}
+	return nil
+}
+
+// isClosedErr classifies listener/mux close errors from shutdown (cmux.Serve, http.Serve etc).
+// Used for non-fatal path in bounded errgroup workers (P5 cmux + existing). Uses errors.Is for
+// known sentinels (including cmux ones) + fallback contains. Never returns true for nil (per SKILL
+// "Errors Are Values" + review finding on nil-true anti-pattern).
+func isClosedErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, net.ErrClosed) || errors.Is(err, http.ErrServerClosed) ||
+		errors.Is(err, cmux.ErrListenerClosed) || errors.Is(err, cmux.ErrServerClosed) {
+		return true
+	}
+	es := err.Error()
+	return strings.Contains(es, "use of closed") || strings.Contains(es, "closed network") || strings.Contains(es, "Server closed") || strings.Contains(es, "listener closed")
 }
 
 func initializeKeypair() error {

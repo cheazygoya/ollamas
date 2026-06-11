@@ -17,19 +17,22 @@
 #   ./scripts/build-local.sh clean           # remove build/
 #   ./scripts/build-local.sh --help
 #
-# After a successful run you will have:
-#   ./ollama                 (the Go binary, gitignored)
-#   build/lib/ollama/llama-server   (the native runner + Metal libs, under build/)
+# After a successful run the script will:
+#   - Produce ./ollama (gitignored) and build/lib/ollama/llama-server (payload)
+#   - Copy the binary + payload to ~/bin so `ollama` works from any terminal
+#     (no leading ./ required, and ~/bin should be in your PATH)
+#   - Safely stop any previous dev server instance started by this script
+#   - Start the fresh build serving BOTH REST (port 11434) and gRPC (port 11435)
 #
-# These are already covered by .gitignore. The binary will discover the
-# payload via the updated logic in llm/llama_binary.go (supports the
-# build/ layout for harness + OLLAMA_GRPC_HOST dev/testing).
+# The installed binary discovers the payload from ~/bin/lib/ollama/ (supported
+# by llm/llama_binary.go for dev layouts).
 #
-# Examples for gRPC vs REST testing:
-#   OLLAMA_GRPC_HOST=127.0.0.1:11435 ./ollama serve
-#   OLLAMA_GRPC_HOST=127.0.0.1:11435 go test -tags=integration -run TestGRPCStreaming ./integration -count=1
+# These artifacts are gitignored where appropriate.
 #
 # See also: docs/development.md and docs/grpc-phased-reliable-approach.md
+#
+# After a successful build you can immediately use the globally installed `ollama`
+# (no ./ prefix). The dev server will already be running with both REST and gRPC.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -40,14 +43,22 @@ usage() {
   cat <<'EOF'
 scripts/build-local.sh - local dev build (Go API + llama-server payload)
 
+After a successful build the script will automatically:
+  - Install ./ollama + the llama-server payload into ~/bin
+  - Make `ollama` available globally (add ~/bin to your PATH if not already)
+  - Stop any previous dev server started by this script
+  - Start the new build serving REST (127.0.0.1:11434) + gRPC (127.0.0.1:11435)
+
 Modes / flags:
   (default)          Full configure (if needed) + build ollama-local target
-                     (produces ./ollama + build/lib/ollama/llama-server etc.)
+                     (then auto-install + restart dev server with gRPC)
   configure          Only run cmake -B build . (idempotent)
   build              Build the default target (ollama-local or ollama-go)
+                     (then auto-install + restart dev server with gRPC)
   clean              Remove the build/ directory
   --go-only          Build only the Go layer (ollama-go target). Much faster
                      once the native payload has been built at least once.
+                     (then auto-install + restart dev server with gRPC)
   --target <t>       Build a specific cmake target (advanced)
   --preset <name>    Use a specific configure preset from CMakePresets.json
   -j, --parallel N   Override parallelism (default: auto-detect)
@@ -63,6 +74,11 @@ Examples:
   ./scripts/build-local.sh --go-only
   ./scripts/build-local.sh clean
   OLLAMA_MLX_BACKENDS= ./scripts/build-local.sh   # lighter, no MLX
+
+After running, simply use the global command:
+  ollama serve          # (already running with REST + gRPC after build)
+  ollama --version
+  grpcurl --plaintext localhost:11435 ollama.api.v1.ChatService/ChatStream ...
 EOF
 }
 
@@ -152,6 +168,72 @@ do_clean() {
   # or want to keep a working one while cleaning the cmake tree.
 }
 
+# do_install_and_serve: After a successful build, install the ollama binary + payload
+# to ~/bin so it is available as a normal `ollama` command from any shell (no ./ needed).
+# Then safely replace any previous dev server instance and start the new one
+# listening on standard dev ports with both REST (11434) and gRPC (11435) enabled.
+do_install_and_serve() {
+  echo
+  echo ">>> Installing ollama to ~/bin for global access (no ./ prefix required)..."
+  mkdir -p "$HOME/bin"
+  mkdir -p "$HOME/bin/lib/ollama"
+
+  cp -f "./ollama" "$HOME/bin/ollama"
+  cp -f "build/lib/ollama/llama-server" "$HOME/bin/lib/ollama/llama-server" 2>/dev/null || true
+
+  chmod +x "$HOME/bin/ollama" "$HOME/bin/lib/ollama/llama-server" 2>/dev/null || true
+
+  echo "    Binary : $HOME/bin/ollama"
+  echo "    Payload: $HOME/bin/lib/ollama/llama-server"
+  echo
+  echo ">>> Make sure ~/bin is in your PATH (add to ~/.zshrc or ~/.bash_profile if needed):"
+  echo "    export PATH=\"\$HOME/bin:\$PATH\""
+  echo
+
+  echo ">>> Stopping any previous dev ollama instance (replacing with new build)..."
+  local pid_file="$HOME/.ollama-dev.pid"
+  if [ -f "$pid_file" ]; then
+    local old_pid
+    old_pid=$(cat "$pid_file" 2>/dev/null || true)
+    if [ -n "$old_pid" ] && kill -0 "$old_pid" 2>/dev/null; then
+      echo "    Stopping previous dev server (PID $old_pid)..."
+      kill -TERM "$old_pid" 2>/dev/null || true
+      sleep 1
+      kill -9 "$old_pid" 2>/dev/null || true
+    fi
+    rm -f "$pid_file"
+  fi
+
+  # Belt-and-suspenders: also try to stop any other ollama serve that might be using the user bin
+  # (safe because we use exact path match where possible)
+  pkill -f "$HOME/bin/ollama serve" 2>/dev/null || true
+  sleep 0.5
+
+  echo ">>> Starting new ollama dev server (REST on 11434 + gRPC on 11435)..."
+  local log_file="$HOME/.ollama-dev.log"
+  OLLAMA_HOST=127.0.0.1:11434 \
+  OLLAMA_GRPC_HOST=127.0.0.1:11435 \
+    nohup "$HOME/bin/ollama" serve > "$log_file" 2>&1 &
+  local new_pid=$!
+  echo "$new_pid" > "$pid_file"
+
+  echo "    PID    : $new_pid"
+  echo "    Log    : $log_file"
+  echo "    To stop: kill \$(cat $pid_file)"
+  echo "    To tail: tail -f $log_file"
+  echo
+  echo ">>> Server is now running with both REST and gRPC enabled."
+  echo "    REST : http://127.0.0.1:11434"
+  echo "    gRPC : http://127.0.0.1:11435  (use OLLAMA_GRPC_HOST in clients/tests)"
+  echo
+  echo "    Quick checks:"
+  echo "      curl -s http://127.0.0.1:11434/api/version | cat"
+  echo "      grpcurl --plaintext localhost:11435 ollama.api.v1.ChatService/ChatStream   # (example)"
+  echo
+  echo "Tip: Subsequent ./scripts/build-local.sh --go-only will rebuild and automatically"
+  echo "     replace the running dev server with the fresh binary + payload."
+}
+
 case "$MODE" in
   clean)
     do_clean
@@ -178,27 +260,8 @@ echo
 echo ">>> Build complete."
 echo "    Go binary     : $(ls -l ./ollama 2>/dev/null || echo 'not present')"
 echo "    llama-server  : $(ls -l build/lib/ollama/llama-server 2>/dev/null || echo 'not present under build/lib/ollama/')"
-echo
-echo "To run with both REST and gRPC (separate ports, as used in gRPC reports/tests):"
-echo "  OLLAMA_GRPC_HOST=127.0.0.1:11435 ./ollama serve"
-echo
-echo "Or SAMEPORT (cmux, more advanced):"
-echo "  OLLAMA_GRPC_SAMEPORT=1 ./ollama serve"
-echo
-echo "Integration gRPC streaming test (requires model + the payload we just built):"
-echo "  OLLAMA_GRPC_HOST=127.0.0.1:11435 go test -tags=integration -run TestGRPCStreaming ./integration -count=1 -timeout=5m"
-echo
-echo "Quality/parity/edge-case comparison (real gRPC data vs REST; tools in streams, mid-gen cancel+token counts, OTEL/pprof/metrics check; SAMEPORT + separate port):"
-echo "  # Separate port (standard):"
-echo "  OLLAMA_GRPC_HOST=127.0.0.1:11435 ./ollama serve &"
-echo "  go run scripts/quality-grpc-comparison.go -model llama3.2:1b"
-echo "  # SAMEPORT (cmux):"
-echo "  OLLAMA_GRPC_SAMEPORT=1 ./ollama serve &"
-echo "  go run scripts/quality-grpc-comparison.go -sameport -rest http://127.0.0.1:11434 -grpc 127.0.0.1:11434 -model llama3.2:1b"
-echo "  See scripts/quality-grpc-comparison.go header + docs/development.md + docs/grpc-phased-reliable-approach.md for details and expected token matching."
-echo
-echo "For pure-Go iteration after the native payload exists once, you can also just do:"
-echo "  go build -o ollama ."
-echo "  OLLAMA_GRPC_HOST=127.0.0.1:11435 ./ollama serve"
-echo
-echo "Tip: ./scripts/build-local.sh --go-only   is fast for Go-only changes (gRPC handlers, clients, converters, etc.)."
+
+# Automatically install to user bin and (re)start the dev server with both REST + gRPC.
+# This fulfills the request to have a globally available `ollama` and a running
+# instance serving the updated code on the standard dev ports after every build.
+do_install_and_serve

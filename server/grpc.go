@@ -645,16 +645,21 @@ func convertPBToolsDefsToAPI(pbTools []*v1.Tool) api.Tools {
 	}
 	out := make(api.Tools, len(pbTools))
 	for i, t := range pbTools {
+		tf := api.ToolFunction{
+			Name:        t.Function.GetName(),
+			Description: t.Function.GetDescription(),
+		}
+		if pbytes := t.Function.GetParameters(); len(pbytes) > 0 {
+			if err := json.Unmarshal(pbytes, &tf.Parameters); err != nil {
+				slog.Debug("convertPBToolsDefsToAPI params decision", "component", "grpc", "reason", "json unmarshal of pb ToolFunction parameters (json schema bytes) to api.ToolFunctionParameters failed; fallback zero keeps safe (error checked+logged per SKILL; non-fatal for req fidelity)", "error", err, "status", "fallback")
+			}
+		}
 		out[i] = api.Tool{
-			Type: t.Type,
-			Function: api.ToolFunction{
-				Name:        t.Function.GetName(),
-				Description: t.Function.GetDescription(),
-				// Parameters bytes (json schema) -> ToolFunctionParameters best-effort via its unmarshal paths if json hit; sufficient for req tool defs + roundtrip tables
-			},
+			Type:     t.Type,
+			Function: tf,
 		}
 	}
-	slog.Debug("convertPBToolsDefsToAPI decision", "component", "grpc", "reason", "mapped pb repeated Tool (function defs) to api.Tools; fuller req tools for chat (oneof/function style) enabling tools+vision+format cases in gRPC streams/unary", "count", len(out), "status", "ok")
+	slog.Debug("convertPBToolsDefsToAPI decision", "component", "grpc", "reason", "mapped pb repeated Tool (function defs + full parameters schema bytes unmarshaled to ordered/typed for api) to api.Tools; now full req tool schema fidelity for gRPC vs REST (addresses concern #1 tool schemas roundtrip)", "count", len(out), "status", "ok")
 	return out
 }
 

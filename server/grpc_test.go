@@ -52,8 +52,8 @@ func TestConvertChatRoundtrip(t *testing.T) {
 			want: api.ChatRequest{
 				Model:  "llama3",
 				Format: json.RawMessage(`{"type":"object","properties":{"city":{"type":"string"}}}`),
-				Tools: []api.Tool{{Type: "function", Function: api.ToolFunction{Name: "get_weather", Description: "weather"}}},
-				// options map values as any strings; struct exercised in convert
+				Tools: []api.Tool{{Type: "function", Function: api.ToolFunction{Name: "get_weather", Description: "weather", Parameters: api.ToolFunctionParameters{Type: "object"}}}},
+				// options map values as any strings; struct exercised in convert; now Parameters schema unmarshaled for full tool schema fidelity (pb bytes <-> api struct)
 			},
 		},
 		{
@@ -104,6 +104,9 @@ func TestConvertChatRoundtrip(t *testing.T) {
 			if len(tt.want.Tools) > 0 {
 				assert.Equal(t, len(tt.want.Tools), len(apiOut.Tools))
 				assert.Equal(t, tt.want.Tools[0].Function.Name, apiOut.Tools[0].Function.Name)
+				assert.Equal(t, tt.want.Tools[0].Function.Description, apiOut.Tools[0].Function.Description)
+				// tool schema params fidelity (critical for concern #1): now asserted post convert fix
+				assert.Equal(t, tt.want.Tools[0].Function.Parameters.Type, apiOut.Tools[0].Function.Parameters.Type)
 			}
 			if len(tt.want.Format) > 0 {
 				assert.Equal(t, tt.want.Format, apiOut.Format)
@@ -192,6 +195,7 @@ func TestConvertResponsesToPB(t *testing.T) {
 
 func TestConvertGenerateEmbedFuller(t *testing.T) {
 	// fuller for gen (context, system, raw, done_reason, created) + embed options
+	// Extended per grpc-fidelity-and-parity-plan.md for tool schemas, format/structured, truncate cases in Generate/Embed.
 	pbGen := &v1.GenerateRequest{
 		Model:    "llama3",
 		Prompt:   "test",
@@ -275,6 +279,29 @@ func TestConvertHelperToolCallsAndOptions(t *testing.T) {
 	// options struct (called inside convertToAPIChat for non-empty)
 	pbWithOpts := &v1.ChatRequest{Model: "m", Options: map[string]string{"top_p": "0.9"}}
 	_ = convertToAPIChat(pbWithOpts) // triggers struct decision log + convertOptionsToStruct
+
+	// bidirectional tool *defs* schema roundtrip (api.Tools -> pb -> api) for full fidelity on tool schemas (parameters json)
+	// exercises convertAPIToolsToPB + convertPBToolsDefsToAPI; key for concern #1 + table verifiability (was missing pre-fix)
+	origDefs := api.Tools{{
+		Type: "function",
+		Function: api.ToolFunction{
+			Name:        "get_weather",
+			Description: "weather desc",
+			Parameters:  api.ToolFunctionParameters{Type: "object", Required: []string{"location"}},
+		},
+	}}
+	pbDefs := convertAPIToolsToPB(origDefs)
+	assert.NotNil(t, pbDefs)
+	assert.Len(t, pbDefs, 1)
+	assert.NotNil(t, pbDefs[0].Function)
+	assert.Equal(t, "get_weather", pbDefs[0].Function.Name)
+	assert.True(t, len(pbDefs[0].Function.Parameters) > 0, "pb should have params bytes from .String()")
+
+	apiBack := convertPBToolsDefsToAPI(pbDefs)
+	assert.Len(t, apiBack, 1)
+	assert.Equal(t, "get_weather", apiBack[0].Function.Name)
+	assert.Equal(t, "object", apiBack[0].Function.Parameters.Type)
+	assert.Equal(t, []string{"location"}, apiBack[0].Function.Parameters.Required)
 }
 
 // Phase 5 admin: table-driven tests for fleshed Show (details) + Pull/Push progress streams converts.

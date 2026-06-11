@@ -491,6 +491,24 @@ func TestGRPCStreaming(t *testing.T) {
 		require.NotEmpty(t, gResp)
 
 		slog.Info("high_level_grpc_client positive", "chat_len", len(hContent), "gen_len", len(gResp), "pe", hPE, "e", hE, "done", hDone)
+
+		// Pull/Push high-level client surface exercise (per grpc-fidelity plan concern #4 + C.1).
+		// Actual registry ops may fail (or be slow/noop for existing model); we call to cover New+method+stream
+		// return type + ctx propagation + client wrapper (no Receive to keep test bounded/hermetic; err ok).
+		// Provides concrete call evidence under SAMEPORT/mixed/harness matrix (with -race recommended).
+		pullReq := connect.NewRequest(&v1.PullModelRequest{Model: "smoketest-nonexistent-pull-404", Insecure: true})
+		pst, perr := gc.Pull(ctx, pullReq)
+		_ = pst
+		if perr != nil {
+			t.Logf("high_level Pull (expected err for smoke model): %v", perr)
+		}
+		pushReq := connect.NewRequest(&v1.PushModelRequest{Model: "smoketest-nonexistent-push-404", Insecure: true})
+		pust, puerr := gc.Push(ctx, pushReq)
+		_ = pust
+		if puerr != nil {
+			t.Logf("high_level Push (expected err for smoke model): %v", puerr)
+		}
+		slog.Info("high_level_grpc_client Pull/Push surface exercised", "pull_err", perr != nil, "push_err", puerr != nil)
 	})
 
 	// --- sameport_mixed_rest_grpc: dedicated subtest for SAMEPORT=1 + high-level client + mixed REST (api.Client) + gRPC

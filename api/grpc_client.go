@@ -303,26 +303,42 @@ func (c *GRPCClient) ChatStream(ctx context.Context, req *connect.Request[v1.Cha
 	return stream, nil
 }
 
-// GenerateStream similar to ChatStream (ctx, bounded, logs, limited retry on connect).
+// GenerateStream similar to ChatStream (ctx, bounded, logs, limited retry on initial connect for transient; mid-stream use caller ctx cancel).
+// Now consistent with ChatStream per reliability review (high-level client methods).
 func (c *GRPCClient) GenerateStream(ctx context.Context, req *connect.Request[v1.GenerateRequest]) (*connect.ServerStreamForClient[v1.GenerateResponse], error) {
 	if req == nil || req.Msg == nil {
 		return nil, errors.New("grpc client generatestream: nil req")
 	}
 	model := req.Msg.Model
 	start := time.Now()
-	slog.Debug("grpc client stream start", "component", "api/grpc-client", "rpc", "GenerateStream", "model", model, "reason", "ctx first; see ChatStream", "stream_id", "", "status", "start")
+	slog.Debug("grpc client stream start", "component", "api/grpc-client", "rpc", "GenerateStream", "model", model, "reason", "ctx first (SKILL); stream connect; retry only on initial (mid use cancel+new per finding); bounded by select on Done in caller + handler", "stream_id", "", "status", "start")
 	stream, err := c.gen.GenerateStream(ctx, req)
 	dur := time.Since(start).Milliseconds()
 	if err != nil {
-		return nil, fmt.Errorf("grpc client GenerateStream %s: %w", model, err)
+		if isRetryable(err) {
+			slog.Info("grpc client retry decision", "component", "api/grpc-client", "rpc", "GenerateStream", "model", model, "duration_ms", dur, "status", "transient", "reason", "initial stream connect transient (Unavailable from errToConnect); limited retry for stream simplicity; agent can re-call", "error", err)
+			// limited one retry attempt for connect phase; ctx select + jitter (SKILL p13/p41; no bare sleep)
+			jitter := 100*time.Millisecond + time.Duration(time.Now().UnixNano()%50)*time.Millisecond
+			select {
+			case <-ctx.Done():
+				return nil, fmt.Errorf("grpc client GenerateStream %s ctx during retry backoff: %w", model, ctx.Err())
+			case <-time.After(jitter):
+			}
+			stream, err = c.gen.GenerateStream(ctx, req)
+			if err != nil {
+				return nil, fmt.Errorf("grpc client GenerateStream %s: %w", model, err)
+			}
+		} else {
+			return nil, fmt.Errorf("grpc client GenerateStream %s: %w", model, err)
+		}
 	}
-	slog.Info("grpc client stream connected", "component", "api/grpc-client", "rpc", "GenerateStream", "model", model, "duration_ms", dur, "status", "ok", "reason", "stream open (limited retry skeleton)")
+	slog.Info("grpc client stream connected", "component", "api/grpc-client", "rpc", "GenerateStream", "model", model, "duration_ms", dur, "status", "ok", "reason", "stream open; caller owns Receive loop + cancel for GPU safety + backpressure (select before use)")
 	return stream, nil
 }
 
 // Pull (server stream over ModelsService). Added per Phase 4b to match ChatStream/GenerateStream
-// pattern + server-side modelsHandler Pull (progress for registry ops). Limited retry on initial
-// connect only; caller owns the Receive() loop + ctx cancel for safety.
+// pattern + server-side modelsHandler Pull (progress for registry ops). No auto-retry on stream (caller
+// owns loop + ctx cancel for safety; use isRetryable + re-call on initial err if desired). Rich ctx/logs.
 func (c *GRPCClient) Pull(ctx context.Context, req *connect.Request[v1.PullModelRequest]) (*connect.ServerStreamForClient[v1.ProgressResponse], error) {
 	if req == nil || req.Msg == nil {
 		return nil, errors.New("grpc client pull: nil req")

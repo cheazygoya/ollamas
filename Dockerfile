@@ -216,7 +216,7 @@ COPY cmake cmake
 COPY x/imagegen/mlx x/imagegen/mlx
 COPY go.mod go.sum .
 COPY MLX_VERSION MLX_C_VERSION .
-RUN curl -fsSL https://golang.org/dl/go$(awk '/^go/ { print $2 }' go.mod).linux-$(case $(uname -m) in x86_64) echo amd64 ;; aarch64) echo arm64 ;; esac).tar.gz | tar xz -C /usr/local
+RUN curl -fsSL https://golang.org/dl/go$(awk '/^toolchain / { t=$2 } /^go / { g=$2 } END { v = t ? t : g; sub(/^go/, "", v); print v }' go.mod).linux-$(case $(uname -m) in x86_64) echo amd64 ;; aarch64) echo arm64 ;; esac).tar.gz | tar xz -C /usr/local
 ENV PATH=/usr/local/go/bin:$PATH
 RUN go mod download
 RUN --mount=type=cache,target=/root/.ccache \
@@ -241,7 +241,7 @@ COPY --from=mlx /go/src/github.com/ollama/ollama/dist/lib/ollama /lib/ollama/
 FROM base AS build
 WORKDIR /go/src/github.com/ollama/ollama
 COPY go.mod go.sum .
-RUN curl -fsSL https://golang.org/dl/go$(awk '/^go/ { print $2 }' go.mod).linux-$(case $(uname -m) in x86_64) echo amd64 ;; aarch64) echo arm64 ;; esac).tar.gz | tar xz -C /usr/local
+RUN curl -fsSL https://golang.org/dl/go$(awk '/^toolchain / { t=$2 } /^go / { g=$2 } END { v = t ? t : g; sub(/^go/, "", v); print v }' go.mod).linux-$(case $(uname -m) in x86_64) echo amd64 ;; aarch64) echo arm64 ;; esac).tar.gz | tar xz -C /usr/local
 ENV PATH=/usr/local/go/bin:$PATH
 RUN go mod download
 COPY . .
